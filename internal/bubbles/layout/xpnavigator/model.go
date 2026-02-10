@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/brunoluiz/xpdig/internal/bubbles/component/modal"
 	"github.com/brunoluiz/xpdig/internal/bubbles/component/navigator"
 	"github.com/brunoluiz/xpdig/internal/bubbles/component/statusbar"
 	"github.com/brunoluiz/xpdig/internal/bubbles/component/table"
@@ -44,6 +45,7 @@ type Model struct {
 	keyMap        KeyMap
 	navigator     navigator.Model
 	statusbar     statusbar.Model
+	modal         modal.Model
 	tracer        Tracer
 	width         int
 	height        int
@@ -56,6 +58,13 @@ type Model struct {
 
 	kind       schema.GroupKind
 	pathByData map[string][]string
+
+	// usageData holds Usage association data for the current trace tree.
+	usageData        xplane.UsageData
+	showUsageDetails bool // toggle for virtual sub-rows and markers
+
+	// lastTrace stores the last trace for re-rendering on toggle
+	lastTrace *xplane.Resource
 }
 
 type WithOpt func(*Model)
@@ -94,6 +103,7 @@ func New(
 		logger:        logger,
 		navigator:     navModel,
 		statusbar:     statusModel,
+		modal:         modal.New(),
 		tracer:        tracer,
 		width:         0,
 		height:        0,
@@ -134,11 +144,21 @@ func (m Model) View() string {
 		)
 	}
 
-	return lipgloss.JoinVertical(
+	base := lipgloss.JoinVertical(
 		lipgloss.Left,
 		m.navigator.View(),
 		m.statusbar.View(),
 	)
+
+	if m.modal.Visible {
+		return lipgloss.Place(
+			m.width, m.height,
+			lipgloss.Center, lipgloss.Center,
+			m.modal.View(),
+		)
+	}
+
+	return base
 }
 
 type ColumnLayout int
@@ -155,18 +175,18 @@ func (m Model) getColumns(layout ColumnLayout) []table.Column {
 	switch layout {
 	case ShortObjectColumnLayout:
 		return []table.Column{
-			{Title: HeaderKeyObject, Width: 60},
-			{Title: HeaderKeyGroup, Width: 30},
-			{Title: HeaderKeyResource, Width: 25},
+			{Title: HeaderKeyObject, Width: 55},
+			{Title: HeaderKeyGroup, Width: 25},
+			{Title: HeaderKeyResource, Width: 20},
 			{Title: HeaderKeySynced, Width: 7},
 			{Title: HeaderKeyReady, Width: 7},
 			{Title: HeaderKeyStatus, Width: 68},
 		}
 	case WideObjectColumnLayout:
 		return []table.Column{
-			{Title: HeaderKeyObject, Width: 60},
-			{Title: HeaderKeyGroup, Width: 30},
-			{Title: HeaderKeyResource, Width: 25},
+			{Title: HeaderKeyObject, Width: 55},
+			{Title: HeaderKeyGroup, Width: 25},
+			{Title: HeaderKeyResource, Width: 20},
 			{Title: HeaderKeySynced, Width: 7},
 			{Title: HeaderKeySyncedLast, Width: 19},
 			{Title: HeaderKeyReady, Width: 7},
@@ -222,8 +242,10 @@ func (m *Model) setColumns(gk schema.GroupKind) {
 
 func (m *Model) setData(data *xplane.Resource) {
 	m.ready = true
+	m.lastTrace = data
 	rows := []navigator.DataRow{}
 	m.kind = data.Unstructured.GroupVersionKind().GroupKind()
+	m.usageData = xplane.CollectUsageData(data)
 	m.traceToRows(data, &rows, 0, []string{}, []bool{})
 	m.navigator.SetData(rows)
 }
@@ -231,13 +253,14 @@ func (m *Model) setData(data *xplane.Resource) {
 func (m Model) traceToRows(v *xplane.Resource, rows *[]navigator.DataRow, depth int, currentPath []string, isLastChilds []bool) {
 	name := fmt.Sprintf("%s/%s", v.Unstructured.GetKind(), v.Unstructured.GetName())
 	group := v.Unstructured.GetObjectKind().GroupVersionKind().Group
+	rowID := fmt.Sprintf("%s.%s/%s", v.Unstructured.GetKind(), group, v.Unstructured.GetName())
 	row := navigator.DataRow{
-		ID:      fmt.Sprintf("%s.%s/%s", v.Unstructured.GetKind(), group, v.Unstructured.GetName()),
+		ID:      rowID,
 		Data:    v,
 		Columns: []string{},
 	}
 
-	// Build tree prefix
+	// Build tree prefix (standard connectors)
 	var prefix string
 	if depth > 0 {
 		for i := 0; i < depth-1; i++ {
@@ -253,11 +276,22 @@ func (m Model) traceToRows(v *xplane.Resource, rows *[]navigator.DataRow, depth 
 			prefix += "├─ "
 		}
 	}
+
 	label := prefix + name
 
+	// Check if this row is a target of a Usage — add a cyan diamond marker (only when toggle is on)
+	if m.showUsageDetails {
+		if _, ok := m.usageData.TargetUsageLabels[rowID]; ok {
+			row.ConnectorSuffix = " ◆"
+			row.ConnectorSuffixColor = lipgloss.Color("#00D7FF")
+		}
+	}
+
+	paused := false
 	if v.Unstructured.GetAnnotations()["crossplane.io/paused"] == "true" {
 		label += " (paused)"
 		row.Color = lipgloss.ANSIColor(ansi.Yellow)
+		paused = true
 	}
 
 	var data map[string]string
@@ -274,8 +308,13 @@ func (m Model) traceToRows(v *xplane.Resource, rows *[]navigator.DataRow, depth 
 			HeaderKeyState:         resStatus.State,
 			HeaderKeyStatus:        resStatus.Status,
 		}
-		if !resStatus.Ok {
-			row.Color = lipgloss.ANSIColor(ansi.Red)
+		if !paused {
+			switch {
+			case resStatus.Ok:
+				row.Color = lipgloss.Color("#39FF14")
+			default:
+				row.Color = lipgloss.ANSIColor(ansi.Red)
+			}
 		}
 	} else {
 		resStatus := xplane.GetResourceStatus(v, label)
@@ -291,8 +330,13 @@ func (m Model) traceToRows(v *xplane.Resource, rows *[]navigator.DataRow, depth 
 		}
 		// NOTE: in cases where a resource relies on auto-ready, such as kubernetes MRs in Crossplane v2, the synced/ready will
 		// always be "-". To avoid it to be shown in red, the second conditional has been added.
-		if !resStatus.Ok && (resStatus.Synced != "-" || resStatus.Ready != "-") {
-			row.Color = lipgloss.ANSIColor(ansi.Red)
+		if !paused {
+			switch {
+			case resStatus.Ok:
+				row.Color = lipgloss.Color("#39FF14")
+			case !resStatus.Ok && (resStatus.HasSyncedCondition || resStatus.Ready != "-"):
+				row.Color = lipgloss.ANSIColor(ansi.Red)
+			}
 		}
 	}
 
@@ -307,10 +351,77 @@ func (m Model) traceToRows(v *xplane.Resource, rows *[]navigator.DataRow, depth 
 	path = append(path, name)
 	m.pathByData[row.ID] = path
 
+	// If this is a Usage resource and usage details are toggled on, inject virtual sub-rows
+	if m.showUsageDetails {
+		if assoc := xplane.GetUsageAssociation(v); assoc != nil {
+			m.addUsageVirtualRows(v, rows, depth, isLastChilds, assoc)
+		}
+	}
+
 	// Recursively process children
 	for i, cv := range v.Children {
 		last := i == len(v.Children)-1
 		m.traceToRows(cv, rows, depth+1, path, append(isLastChilds, last))
+	}
+}
+
+// addUsageVirtualRows adds display-only sub-rows under a Usage node showing
+// the "by" and "of" resource references with cyan styling.
+func (m Model) addUsageVirtualRows(v *xplane.Resource, rows *[]navigator.DataRow, depth int, isLastChilds []bool, assoc *xplane.UsageAssociation) {
+	// Build the indentation for virtual rows (one level deeper than the Usage)
+	var baseIndent string
+	if depth > 0 {
+		for i := 0; i < depth; i++ {
+			if isLastChilds[i] {
+				baseIndent += "   "
+			} else {
+				baseIndent += "│  "
+			}
+		}
+	}
+
+	hasChildren := len(v.Children) > 0
+
+	// Collect virtual entries
+	type virtualEntry struct {
+		role  string // "by" or "of"
+		label string
+	}
+	var entries []virtualEntry
+	if assoc.ByLabel != "" {
+		entries = append(entries, virtualEntry{role: "by", label: assoc.ByLabel})
+	}
+	if assoc.OfLabel != "" {
+		entries = append(entries, virtualEntry{role: "of", label: assoc.OfLabel})
+	}
+
+	for i, entry := range entries {
+		isLast := i == len(entries)-1 && !hasChildren
+		var connector string
+		if isLast {
+			connector = "└─ "
+		} else {
+			connector = "├─ "
+		}
+
+		virtualLabel := baseIndent + connector + entry.role + ": " + entry.label
+
+		virtualRow := navigator.DataRow{
+			ID:   assoc.UsageID + "/" + entry.role,
+			Data: v, // Point back to the Usage resource for interactions
+		}
+		virtualRow.ConnectorPrefix = virtualLabel
+		virtualRow.ConnectorColor = lipgloss.Color("#00D7FF")
+
+		// Fill columns — only the OBJECT column has content
+		for _, col := range m.getColumns(m.getLayout(m.kind)) {
+			if col.Title == HeaderKeyObject {
+				virtualRow.Columns = append(virtualRow.Columns, "")
+			} else {
+				virtualRow.Columns = append(virtualRow.Columns, "")
+			}
+		}
+		*rows = append(*rows, virtualRow)
 	}
 }
 

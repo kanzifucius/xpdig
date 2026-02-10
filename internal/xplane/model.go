@@ -49,6 +49,7 @@ type ResourceStatus struct {
 	SyncedLastTransition time.Time
 	Status               string
 	Ok                   bool
+	HasSyncedCondition   bool
 }
 
 func IsPkg(gk schema.GroupKind) bool {
@@ -60,6 +61,7 @@ func IsPkg(gk schema.GroupKind) bool {
 func GetResourceStatus(r *Resource, name string) ResourceStatus {
 	readyCond := r.GetCondition(xpv1.TypeReady)
 	syncedCond := r.GetCondition(xpv1.TypeSynced)
+	ok, hasSyncedCondition := okForReadySynced(readyCond, syncedCond)
 
 	var status, m string
 	switch {
@@ -70,25 +72,9 @@ func GetResourceStatus(r *Resource, name string) ResourceStatus {
 		// if there is an error we want to show it
 		status = "Error"
 		m = r.Error.Error()
-	case readyCond.Status == corev1.ConditionTrue && syncedCond.Status == corev1.ConditionTrue:
-		// if both are true we want to show the ready reason only
-		status = string(readyCond.Reason)
-
-	// The following cases are for when one of the conditions is not true (false or unknown),
-	// prioritizing synced over readiness in case of issues.
-	case syncedCond.Status != corev1.ConditionTrue &&
-		(syncedCond.Reason != "" || syncedCond.Message != ""):
-		status = string(syncedCond.Reason)
-		m = syncedCond.Message
-	case readyCond.Status != corev1.ConditionTrue &&
-		(readyCond.Reason != "" || readyCond.Message != ""):
-		status = string(readyCond.Reason)
-		m = readyCond.Message
-
 	default:
-		// both are unknown or unset, let's try showing the ready reason, probably empty
-		status = string(readyCond.Reason)
-		m = readyCond.Message
+		// Ready is the primary reason when healthy, but we favor synced failures.
+		status, m = resourceStatusFromConditions(readyCond, syncedCond)
 	}
 
 	// Append the message to the status if it's not empty
@@ -104,7 +90,8 @@ func GetResourceStatus(r *Resource, name string) ResourceStatus {
 		Synced:               mapEmptyStatusToDash(syncedCond.Status),
 		SyncedLastTransition: syncedCond.LastTransitionTime.Time,
 		Status:               status,
-		Ok:                   (syncedCond.Status == corev1.ConditionTrue && readyCond.Status == corev1.ConditionTrue),
+		Ok:                   ok,
+		HasSyncedCondition:   hasSyncedCondition,
 	}
 }
 
@@ -127,6 +114,7 @@ func GetPkgResourceStatus(r *Resource, name string) PkgResourceStatus {
 
 	healthyCond := r.GetCondition(pkgv1.TypeHealthy)
 	installedCond := r.GetCondition(pkgv1.TypeInstalled)
+	hasInstalledCondition := conditionPresent(installedCond)
 
 	gk := r.Unstructured.GroupVersionKind().GroupKind()
 	switch {
@@ -136,34 +124,14 @@ func GetPkgResourceStatus(r *Resource, name string) PkgResourceStatus {
 		status = "Error"
 		m = r.Error.Error()
 	case xpkg.IsPackageType(gk):
-		switch {
-		case healthyCond.Status == corev1.ConditionTrue && installedCond.Status == corev1.ConditionTrue:
-			// If both are true we want to show the healthy reason only
-			status = string(healthyCond.Reason)
-
-		// The following cases are for when one of the conditions is not true (false or unknown),
-		// prioritizing installed over healthy in case of issues.
-		case installedCond.Status != corev1.ConditionTrue &&
-			(installedCond.Reason != "" || installedCond.Message != ""):
-			status = string(installedCond.Reason)
-			m = installedCond.Message
-		case healthyCond.Status != corev1.ConditionTrue &&
-			(healthyCond.Reason != "" || healthyCond.Message != ""):
-			status = string(healthyCond.Reason)
-			m = healthyCond.Message
-		default:
-			// both are unknown or unset, let's try showing the installed reason
-			status = string(installedCond.Reason)
-			m = installedCond.Message
-		}
+		status, m = pkgStatusFromConditions(healthyCond, installedCond, hasInstalledCondition)
 
 		if packageImg, err = fieldpath.Pave(r.Unstructured.Object).GetString("spec.package"); err != nil {
 			state = err.Error()
 		}
 	case xpkg.IsPackageRevisionType(gk):
 		// package revisions only have the healthy condition, so use that
-		status = string(healthyCond.Reason)
-		m = healthyCond.Message
+		status, m = pkgStatusFromConditions(healthyCond, installedCond, false)
 
 		// Get the state (active vs. inactive) of this package revision.
 		var err error
@@ -210,9 +178,119 @@ func GetPkgResourceStatus(r *Resource, name string) PkgResourceStatus {
 		HealthyLastTransition:   healthyCond.LastTransitionTime.Time,
 		State:                   mapEmptyStatusToDash(corev1.ConditionStatus(state)),
 		Status:                  status,
-		Ok: (installedCond.Status == corev1.ConditionTrue && healthyCond.Status == corev1.ConditionTrue) ||
+		Ok: okForHealthyInstalled(healthyCond, installedCond, hasInstalledCondition) ||
 			strings.HasPrefix(status, "Active") ||
 			strings.HasPrefix(status, "Healthy"),
+	}
+}
+
+// UsageAssociation represents the relationship between a Usage resource,
+// its consumer ("by") and its target ("of").
+type UsageAssociation struct {
+	UsageID   string // ID of the Usage resource itself
+	UsageName string // Display name of the Usage (Kind/Name)
+	ByID      string // ID of the "by" resource (consumer)
+	ByLabel   string // Display label (Kind/Name) of the "by" resource
+	OfID      string // ID of the "of" resource (target/protected)
+	OfLabel   string // Display label (Kind/Name) of the "of" resource
+}
+
+// IsUsage returns true if the resource is a Crossplane Usage kind.
+func IsUsage(r *Resource) bool {
+	return r.Unstructured.GetKind() == "Usage"
+}
+
+// GetUsageAssociation extracts the by/of association from a Usage resource.
+// Returns nil if not a Usage or if the association fields are missing.
+func GetUsageAssociation(r *Resource) *UsageAssociation {
+	if !IsUsage(r) {
+		return nil
+	}
+
+	paved := fieldpath.Pave(r.Unstructured.Object)
+
+	byID, byLabel := usageRefToIDAndLabel(paved, "spec.by")
+	ofID, ofLabel := usageRefToIDAndLabel(paved, "spec.of")
+
+	if byID == "" && ofID == "" {
+		return nil
+	}
+
+	group := r.Unstructured.GroupVersionKind().Group
+	usageID := fmt.Sprintf("%s.%s/%s", r.Unstructured.GetKind(), group, r.Unstructured.GetName())
+	usageName := fmt.Sprintf("%s/%s", r.Unstructured.GetKind(), r.Unstructured.GetName())
+
+	return &UsageAssociation{
+		UsageID:   usageID,
+		UsageName: usageName,
+		ByID:      byID,
+		ByLabel:   byLabel,
+		OfID:      ofID,
+		OfLabel:   ofLabel,
+	}
+}
+
+// usageRefToIDAndLabel extracts a resource reference from the given path prefix
+// and returns both the row ID (Kind.Group/Name) and display label (Kind/Name).
+func usageRefToIDAndLabel(paved *fieldpath.Paved, prefix string) (string, string) {
+	kind, err := paved.GetString(prefix + ".kind")
+	if err != nil || kind == "" {
+		return "", ""
+	}
+	name, err := paved.GetString(prefix + ".resourceRef.name")
+	if err != nil || name == "" {
+		return "", ""
+	}
+	apiVersion, _ := paved.GetString(prefix + ".apiVersion")
+	group := apiVersionToGroup(apiVersion)
+
+	id := fmt.Sprintf("%s.%s/%s", kind, group, name)
+	label := fmt.Sprintf("%s/%s", kind, name)
+	return id, label
+}
+
+// apiVersionToGroup extracts the group from an apiVersion string.
+// e.g. "network.azure.upbound.io/v1beta2" -> "network.azure.upbound.io"
+// e.g. "v1" -> ""
+func apiVersionToGroup(apiVersion string) string {
+	parts := strings.SplitN(apiVersion, "/", 2)
+	if len(parts) == 2 {
+		return parts[0]
+	}
+	return ""
+}
+
+// UsageData holds the collected Usage relationship data for a resource tree.
+type UsageData struct {
+	// Associations is the list of all Usage associations found in the tree.
+	Associations []UsageAssociation
+	// TargetUsageLabels maps a target row ID to the Usage display name that references it.
+	// Used to add markers like "◆ (Usage/name)" on target rows.
+	TargetUsageLabels map[string]string
+}
+
+// CollectUsageData walks the resource tree and collects all Usage
+// associations plus target-to-usage label mappings.
+func CollectUsageData(root *Resource) UsageData {
+	data := UsageData{
+		TargetUsageLabels: make(map[string]string),
+	}
+	collectUsageDataRecursive(root, &data)
+	return data
+}
+
+func collectUsageDataRecursive(r *Resource, data *UsageData) {
+	if assoc := GetUsageAssociation(r); assoc != nil {
+		data.Associations = append(data.Associations, *assoc)
+		if assoc.ByID != "" {
+			data.TargetUsageLabels[assoc.ByID] = assoc.UsageName
+		}
+		if assoc.OfID != "" {
+			data.TargetUsageLabels[assoc.OfID] = assoc.UsageName
+		}
+	}
+	for _, child := range r.Children {
+		collectUsageDataRecursive(child, data)
 	}
 }
 

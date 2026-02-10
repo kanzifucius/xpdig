@@ -29,8 +29,12 @@ type Model struct {
 type Row []Cell
 
 type Cell struct {
-	Value string
-	Style lipgloss.Style
+	Value       string
+	Style       lipgloss.Style
+	Prefix      string         // Optional styled prefix (e.g. tree connectors for virtual rows)
+	PrefixStyle lipgloss.Style // Style for the prefix only
+	Suffix      string         // Optional styled suffix (e.g. usage markers)
+	SuffixStyle lipgloss.Style // Style for the suffix only
 }
 
 // Column defines the table structure.
@@ -272,13 +276,53 @@ func (m *Model) renderRow(r int) string {
 		if m.cols[i].Width <= 0 {
 			continue
 		}
-		style := lipgloss.NewStyle().Width(m.cols[i].Width).MaxWidth(m.cols[i].Width).Inline(true)
+
+		colWidth := m.cols[i].Width
 		renderedCell := m.styles.Cell
 		if r != m.cursor {
 			renderedCell = renderedCell.Inherit(c.Style)
 		}
 
-		s = append(s, renderedCell.Render(style.Render(runewidth.Truncate(c.Value, m.cols[i].Width, "…"))))
+		hasPrefix := c.Prefix != ""
+		hasSuffix := c.Suffix != ""
+
+		if hasPrefix || hasSuffix {
+			prefixWidth := 0
+			suffixWidth := 0
+			var renderedPrefix, renderedSuffix string
+
+			if hasPrefix {
+				prefixWidth = runewidth.StringWidth(c.Prefix)
+				if r == m.cursor {
+					renderedPrefix = lipgloss.NewStyle().Render(c.Prefix)
+				} else {
+					renderedPrefix = c.PrefixStyle.Render(c.Prefix)
+				}
+			}
+
+			if hasSuffix {
+				suffixWidth = runewidth.StringWidth(c.Suffix)
+				if r == m.cursor {
+					renderedSuffix = lipgloss.NewStyle().Render(c.Suffix)
+				} else {
+					renderedSuffix = c.SuffixStyle.Render(c.Suffix)
+				}
+			}
+
+			valueWidth := colWidth - prefixWidth - suffixWidth
+			if valueWidth < 0 {
+				valueWidth = 0
+			}
+			valueStyle := lipgloss.NewStyle().Width(valueWidth).MaxWidth(valueWidth).Inline(true)
+			truncatedValue := runewidth.Truncate(c.Value, valueWidth, "…")
+			renderedValue := renderedCell.Render(valueStyle.Render(truncatedValue))
+
+			combined := renderedPrefix + renderedValue + renderedSuffix
+			s = append(s, combined)
+		} else {
+			style := lipgloss.NewStyle().Width(colWidth).MaxWidth(colWidth).Inline(true)
+			s = append(s, renderedCell.Render(style.Render(runewidth.Truncate(c.Value, colWidth, "…"))))
+		}
 	}
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, s...)

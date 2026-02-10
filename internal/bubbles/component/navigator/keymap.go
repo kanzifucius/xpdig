@@ -22,6 +22,8 @@ type KeyMap struct {
 	Edit          key.Binding
 	Delete        key.Binding
 	Describe      key.Binding
+	Status        key.Binding
+	ToggleUsage   key.Binding
 	Help          key.Binding
 	CloseFullHelp key.Binding
 }
@@ -94,14 +96,20 @@ func DefaultKeyMap() KeyMap {
 		Describe: key.NewBinding(
 			key.WithKeys("enter", "d"),
 			key.WithHelp("d", "describe")),
+		Status: key.NewBinding(
+			key.WithKeys("s"),
+			key.WithHelp("s", "status")),
+		ToggleUsage: key.NewBinding(
+			key.WithKeys("u"),
+			key.WithHelp("u", "usage")),
 		Help: key.NewBinding(
 			key.WithKeys("?", "h"),
 			key.WithHelp("?/h", "toogle help"),
 		),
 
 		Quit: key.NewBinding(
-			key.WithKeys("q"),
-			key.WithHelp("q", "quit"),
+			key.WithKeys("q", "esc"),
+			key.WithHelp("q/esc", "quit"),
 		),
 	}
 }

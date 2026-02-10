@@ -39,6 +39,13 @@ type EventItemDelete struct {
 	Data any
 }
 
+type EventItemStatus struct {
+	ID   string
+	Data any
+}
+
+type EventToggleUsage struct{}
+
 type EventQuitted struct{}
 
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
@@ -236,10 +243,24 @@ func (m *Model) onKey(msg tea.KeyMsg) tea.Cmd {
 			return EventItemEdit{ID: m.Current().ID, Data: m.Current().Data}
 		}
 	case key.Matches(msg, m.KeyMap.SearchQuit):
-		m.onSearchQuit()
+		if m.searchMode != searchModeOff {
+			m.onSearchQuit()
+		} else {
+			return func() tea.Msg {
+				return EventQuitted{}
+			}
+		}
 	case key.Matches(msg, m.KeyMap.Describe):
 		return func() tea.Msg {
 			return EventItemDescribe{ID: m.Current().ID, Data: m.Current().Data}
+		}
+	case key.Matches(msg, m.KeyMap.Status):
+		return func() tea.Msg {
+			return EventItemStatus{ID: m.Current().ID, Data: m.Current().Data}
+		}
+	case key.Matches(msg, m.KeyMap.ToggleUsage):
+		return func() tea.Msg {
+			return EventToggleUsage{}
 		}
 	case key.Matches(msg, m.KeyMap.Quit):
 		return func() tea.Msg {

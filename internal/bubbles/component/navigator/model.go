@@ -22,8 +22,12 @@ type DataRow struct {
 	ID   string
 	Data any
 
-	Columns []string
-	Color   lipgloss.TerminalColor
+	Columns              []string
+	Color                lipgloss.TerminalColor
+	ConnectorPrefix      string                 // Styled prefix for the OBJECT column (e.g. virtual usage rows)
+	ConnectorColor       lipgloss.TerminalColor // Color for the connector prefix
+	ConnectorSuffix      string                 // Styled suffix for the OBJECT column (e.g. usage markers on targets)
+	ConnectorSuffixColor lipgloss.TerminalColor // Color for the connector suffix
 }
 
 const (
@@ -143,8 +147,28 @@ func (m *Model) doLoadTable() {
 		}
 
 		cols := []table.Cell{}
-		for _, col := range v.Columns {
-			cols = append(cols, table.Cell{Value: col, Style: s})
+		for i, col := range v.Columns {
+			cell := table.Cell{Value: col, Style: s}
+			// Apply connector styling to the first column (OBJECT)
+			if i == 0 {
+				if v.ConnectorPrefix != "" {
+					cell.Prefix = v.ConnectorPrefix
+					ps := lipgloss.NewStyle()
+					if v.ConnectorColor != nil {
+						ps = ps.Foreground(v.ConnectorColor)
+					}
+					cell.PrefixStyle = ps
+				}
+				if v.ConnectorSuffix != "" {
+					cell.Suffix = v.ConnectorSuffix
+					ss := lipgloss.NewStyle()
+					if v.ConnectorSuffixColor != nil {
+						ss = ss.Foreground(v.ConnectorSuffixColor)
+					}
+					cell.SuffixStyle = ss
+				}
+			}
+			cols = append(cols, cell)
 		}
 
 		rows = append(rows, cols)
@@ -172,7 +196,7 @@ func (m Model) ShortHelp() []key.Binding {
 	k := m.KeyMap
 	return append([]key.Binding{},
 		k.Up, k.Down, k.Copy,
-		k.Describe, k.Get, k.Edit, k.Delete,
+		k.Describe, k.Get, k.Edit, k.Delete, k.Status, k.ToggleUsage,
 		k.Search, k.Help, k.Quit,
 	)
 }
